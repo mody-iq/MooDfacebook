@@ -1,28 +1,33 @@
 # MooDfacebook
 
-Jailbreak tweak for **Facebook** on **iOS 18.7 / arm64e / RootHide**.
+Tweak for **Facebook** on **iOS 18.7 / arm64e / RootHide**.
 
-## Features
-- Hide Sponsored / paid posts (EN + AR labels)
-- Hide suggested posts / people you may know
-- Optional hide Stories tray
-- Optional force Dark Mode
-- Settings in **Settings → MooDfacebook** (PreferenceLoader)
+## Features (v0.1.1)
+- Hide **Sponsored / مموّل** posts
+- Hide **Suggested for you / مقترح لك / People you may know**
+- Optional hide **Stories** tray
+- Optional hide **Reels** shelf labels
+- Optional **Force Dark Mode**
+- Preferences via PreferenceLoader plist (if Preferenceloader is installed)
 
-## Package
-- `com.modyiq.moodfacebook`
-- Architecture: `iphoneos-arm64e`
-- Scheme: RootHide (`THEOS_PACKAGE_SCHEME=roothide`)
+## Defaults (all work out of the box)
+| Key | Default |
+|-----|---------|
+| enabled | ON |
+| hideAds | ON |
+| hideSuggested | ON |
+| hideStories | OFF |
+| hideReelsShelf | OFF |
+| forceDark | OFF |
+
+Prefs file: `/var/mobile/Library/Preferences/com.modyiq.moodfacebook.plist`
 
 ## Build
-CI builds on every push to `main` (macOS 15 + RootHide Theos).
-Download the `.deb` from the Actions artifact **MooDfacebook-deb**.
+GitHub Actions on `main` → artifact **MooDfacebook-deb**
 
 ## Install
-1. Install the `.deb` (Sileo / Zebra / dpkg)
+1. Install `.deb`
 2. Respring
-3. Open **Settings → MooDfacebook** and enable options
-4. Relaunch Facebook
+3. Open Facebook
 
-## Author
-Mody
+Author: **Mody**

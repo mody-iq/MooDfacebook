@@ -11,7 +11,4 @@ MooDfacebook_FILES = Tweak.x
 MooDfacebook_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-deprecated-declarations
 MooDfacebook_FRAMEWORKS = UIKit Foundation
 
-SUBPROJECTS += moodfacebookprefs
-
 include $(THEOS_MAKE_PATH)/tweak.mk
-include $(THEOS_MAKE_PATH)/aggregate.mk
