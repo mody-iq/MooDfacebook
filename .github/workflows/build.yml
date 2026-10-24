@@ -1,0 +1,42 @@
+name: Build MooDfacebook
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos (RootHide fork)
+        run: |
+          git clone --recursive https://github.com/roothide/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Install SDK
+        run: |
+          export THEOS=$HOME/theos
+          mkdir -p $THEOS/sdks
+          if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ]; then
+            curl -L https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
+            tar -xf /tmp/sdk.tar.xz -C $THEOS/sdks
+            rm /tmp/sdk.tar.xz
+          fi
+
+      - name: Build package
+        run: |
+          export THEOS=$HOME/theos
+          make package FINALPACKAGE=1
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: MooDfacebook-deb
+          path: packages/*.deb
