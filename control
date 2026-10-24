@@ -1,9 +1,0 @@
-Package: com.mody.moodfacebook
-Name: MooDfacebook
-Version: 1.0.0
-Architecture: iphoneos-arm64e
-Description: Ad removal, Reels/Stories tweaks and stealth viewing for Facebook. Long-press any bottom tab to open settings.
-Maintainer: Mody
-Author: Mody
-Section: Tweaks
-Depends: mobilesubstrate, firmware (>= 15.0)
