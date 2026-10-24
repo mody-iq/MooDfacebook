@@ -9,6 +9,6 @@ TWEAK_NAME = MooDfacebook
 
 MooDfacebook_FILES = Tweak.x
 MooDfacebook_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-deprecated-declarations
-MooDfacebook_FRAMEWORKS = UIKit Foundation
+MooDfacebook_FRAMEWORKS = UIKit Foundation AVFoundation Photos QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk

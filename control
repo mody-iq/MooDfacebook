@@ -1,8 +1,8 @@
 Package: com.modyiq.moodfacebook
 Name: MooDfacebook
-Version: 0.1.1
+Version: 0.2.0
 Architecture: iphoneos-arm64e
-Description: Facebook enhancements for RootHide — hide ads, suggested, stories; force dark mode
+Description: Facebook power toolkit for RootHide — ads, reels, stories, downloads, confirm likes
 Maintainer: Mody
 Author: Mody
 Section: Tweaks
