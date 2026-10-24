@@ -1,0 +1,37 @@
+name: Build MooDfacebook
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tweak
+
+      - name: Install build tools
+        run: brew install ldid make xz || true
+
+      - name: Install Theos (RootHide)
+        run: |
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git "$THEOS"
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p "$THEOS/sdks"
+          cp -R /tmp/sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+
+      - name: Build package
+        working-directory: tweak
+        run: |
+          export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+          make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MooDfacebook-roothide
+          path: tweak/packages/*.deb
