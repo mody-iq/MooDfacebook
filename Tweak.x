@@ -20,24 +20,21 @@ static BOOL MDFOn(NSString *key) {
     return v ? [v boolValue] : YES;
 }
 
-#define kNoAds          @"noAds"
+#define kNoAds           @"noAds"
 #define kNoReelsAutoNext @"noReelsAutoNext"
-#define kReelsNoMute    @"reelsKeepSound"
-#define kStealthStories @"stealthStories"
+#define kReelsNoMute     @"reelsKeepSound"
+#define kStealthStories  @"stealthStories"
 #define kStealthMessages @"stealthMessages"
-#define kNoTyping       @"noTyping"
+#define kNoTyping        @"noTyping"
 
-// ------------------------------------------------------------
-// Ads: hide feed / reels cells marked as sponsored
-// ------------------------------------------------------------
-
-static NSArray<NSString *> *MDFSponsoredWords(void) {
-    return @[@"Sponsored", @"\u0645\u0645\u0648\u0644", @"Sponsoris", @"Patrocinado", @"Gesponsert", @"Reklam"];
-}
+// ---------------- Ads ----------------
 
 static BOOL MDFTextIsSponsored(NSString *s) {
     if (s.length == 0 || s.length > 400) return NO;
-    for (NSString *w in MDFSponsoredWords()) {
+    static NSArray<NSString *> *words;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ words = @[@"Sponsored", @"ممول", @"Sponsoris", @"Patrocinado", @"Gesponsert", @"Reklam"]; });
+    for (NSString *w in words) {
         if ([s rangeOfString:w options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
     }
     return NO;
@@ -57,8 +54,7 @@ static BOOL MDFViewIsSponsored(UIView *v, int depth) {
 - (void)layoutSubviews {
     %orig;
     if (!MDFOn(kNoAds)) return;
-    BOOL ad = MDFViewIsSponsored(self.contentView, 0);
-    if (ad) {
+    if (MDFViewIsSponsored(self.contentView, 0)) {
         self.hidden = YES;
         self.contentView.alpha = 0;
     } else if (self.hidden && self.contentView.alpha == 0) {
@@ -68,7 +64,6 @@ static BOOL MDFViewIsSponsored(UIView *v, int depth) {
 }
 %end
 
-// Block known ad / tracking endpoints at the network level
 static BOOL MDFIsAdURL(NSURL *url) {
     NSString *s = url.absoluteString.lowercaseString;
     if (!s) return NO;
@@ -78,9 +73,14 @@ static BOOL MDFIsAdURL(NSURL *url) {
     return NO;
 }
 
-// ------------------------------------------------------------
-// Stealth: drop "seen" / "read" / typing requests
-// ------------------------------------------------------------
+// ---------------- Stealth ----------------
+
+static BOOL MDFBodyHas(NSString *b, NSArray<NSString *> *keys) {
+    for (NSString *k in keys) {
+        if ([b containsString:k]) return YES;
+    }
+    return NO;
+}
 
 static BOOL MDFShouldBlockRequest(NSURLRequest *req) {
     if (MDFOn(kNoAds) && MDFIsAdURL(req.URL)) return YES;
@@ -88,64 +88,44 @@ static BOOL MDFShouldBlockRequest(NSURLRequest *req) {
     if (body.length == 0 || body.length > 200000) return NO;
     NSString *b = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
     if (!b) return NO;
-    if (MDFOn(kStealthStories)) {
-        for (NSString *k in @[@"StorySeen", @"storiesUpdateSeenState", @"story_seen", @"StoriesSeenMutation", @"bucket_seen"]) {
-            if ([b containsString:k]) return YES;
-        }
-    }
-    if (MDFOn(kStealthMessages)) {
-        for (NSString *k in @[@"MarkThreadRead", @"mark_read", @"markThreadAsRead", @"read_receipt"]) {
-            if ([b containsString:k]) return YES;
-        }
-    }
-    if (MDFOn(kNoTyping)) {
-        for (NSString *k in @[@"typing_indicator", @"TypingIndicator", @"send_typing"]) {
-            if ([b containsString:k]) return YES;
-        }
-    }
+    if (MDFOn(kStealthStories) && MDFBodyHas(b, @[@"StorySeen", @"storiesUpdateSeenState", @"story_seen", @"StoriesSeenMutation", @"bucket_seen"])) return YES;
+    if (MDFOn(kStealthMessages) && MDFBodyHas(b, @[@"MarkThreadRead", @"mark_read", @"markThreadAsRead", @"read_receipt"])) return YES;
+    if (MDFOn(kNoTyping) && MDFBodyHas(b, @[@"typing_indicator", @"TypingIndicator", @"send_typing"])) return YES;
     return NO;
 }
 
+static NSURLRequest *MDFFilterRequest(NSURLRequest *request) {
+    if (!MDFShouldBlockRequest(request)) return request;
+    NSMutableURLRequest *r = [request mutableCopy];
+    r.URL = [NSURL URLWithString:@"https://127.0.0.1:1/mdf-blocked"];
+    r.HTTPBody = nil;
+    return r;
+}
+
 %hook NSURLSession
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    if (MDFShouldBlockRequest(request)) {
-        NSMutableURLRequest *r = [request mutableCopy];
-        r.URL = [NSURL URLWithString:@"https://127.0.0.1:1/mdf-blocked"];
-        r.HTTPBody = nil;
-        return %orig(r, completionHandler);
-    }
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completionHandler {
+    request = MDFFilterRequest(request);
     return %orig;
 }
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    if (MDFShouldBlockRequest(request)) {
-        NSMutableURLRequest *r = [request mutableCopy];
-        r.URL = [NSURL URLWithString:@"https://127.0.0.1:1/mdf-blocked"];
-        r.HTTPBody = nil;
-        return %orig(r);
-    }
+    request = MDFFilterRequest(request);
     return %orig;
 }
 %end
 
-// ------------------------------------------------------------
-// Reels / Stories: no auto-advance, keep sound
-// ------------------------------------------------------------
+// ---------------- Reels / Stories ----------------
 
 %hook AVPlayer
 - (void)setMuted:(BOOL)muted {
-    if (MDFOn(kReelsNoMute) && muted) { %orig(NO); return; }
+    if (MDFOn(kReelsNoMute)) {
+        muted = NO;
+    }
     %orig;
 }
 %end
 
-%hook AVPlayerItem
-- (void)setActionAtItemEnd:(NSInteger)action { %orig; }
-%end
-
 %hook NSNotificationCenter
 - (void)postNotificationName:(NSNotificationName)name object:(id)obj userInfo:(NSDictionary *)info {
-    // When a reel/story video ends, swallow the end notification so the app
-    // does not jump to the next item; loop the current item instead.
     if (MDFOn(kNoReelsAutoNext) && [name isEqualToString:AVPlayerItemDidPlayToEndTimeNotification] && [obj isKindOfClass:[AVPlayerItem class]]) {
         [(AVPlayerItem *)obj seekToTime:kCMTimeZero completionHandler:nil];
         return;
@@ -154,9 +134,7 @@ static BOOL MDFShouldBlockRequest(NSURLRequest *req) {
 }
 %end
 
-// ------------------------------------------------------------
-// Settings panel: long-press any bottom tab bar item
-// ------------------------------------------------------------
+// ---------------- Settings ----------------
 
 @interface MDFSettingsController : UITableViewController
 @end
@@ -168,11 +146,11 @@ static BOOL MDFShouldBlockRequest(NSURLRequest *req) {
 - (instancetype)init {
     if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) {
         self.title = @"MooDfacebook";
-        _sections = @[@"\u0627\u0644\u0625\u0639\u0644\u0627\u0646\u0627\u062a", @"\u0627\u0644\u0631\u064a\u0644\u0632 \u0648\u0627\u0644\u0642\u0635\u0635", @"\u0627\u0644\u0645\u0634\u0627\u0647\u062f\u0629 \u0627\u0644\u062e\u0641\u064a\u0629"];
+        _sections = @[@"الإعلانات", @"الريلز والقصص", @"المشاهدة الخفية"];
         _rows = @[
-            @[@[kNoAds, @"\u0625\u0632\u0627\u0644\u0629 \u0627\u0644\u0625\u0639\u0644\u0627\u0646\u0627\u062a"]],
-            @[@[kNoReelsAutoNext, @"\u0625\u064a\u0642\u0627\u0641 \u0627\u0644\u0627\u0646\u062a\u0642\u0627\u0644 \u0627\u0644\u062a\u0644\u0642\u0627\u0626\u064a"], @[kReelsNoMute, @"\u0625\u0628\u0642\u0627\u0621 \u0627\u0644\u0635\u0648\u062a \u0645\u0641\u0639\u0644\u0627\u064b"]],
-            @[@[kStealthStories, @"\u0625\u062e\u0641\u0627\u0621 \u0645\u0634\u0627\u0647\u062f\u0629 \u0627\u0644\u0642\u0635\u0635"], @[kStealthMessages, @"\u0625\u062e\u0641\u0627\u0621 \u0642\u0631\u0627\u0621\u0629 \u0627\u0644\u0631\u0633\u0627\u0626\u0644"], @[kNoTyping, @"\u0625\u062e\u0641\u0627\u0621 \u062c\u0627\u0631\u064d \u0627\u0644\u0643\u062a\u0627\u0628\u0629"]]
+            @[@[kNoAds, @"إزالة الإعلانات"]],
+            @[@[kNoReelsAutoNext, @"إيقاف الانتقال التلقائي"], @[kReelsNoMute, @"إبقاء الصوت مفعلاً"]],
+            @[@[kStealthStories, @"إخفاء مشاهدة القصص"], @[kStealthMessages, @"إخفاء قراءة الرسائل"], @[kNoTyping, @"إخفاء جارٍ الكتابة"]]
         ];
     }
     return self;
@@ -181,13 +159,22 @@ static BOOL MDFShouldBlockRequest(NSURLRequest *req) {
     [super viewDidLoad];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(mdf_close)];
 }
-- (void)mdf_close { [self dismissViewControllerAnimated:YES completion:nil]; }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return _sections.count; }
-- (NSString *)tableView:(UITableView *)t titleForHeaderInSection:(NSInteger)s { return _sections[s]; }
-- (NSString *)tableView:(UITableView *)t titleForFooterInSection:(NSInteger)s {
-    return s == (NSInteger)_sections.count - 1 ? @"\u0623\u0639\u062f \u062a\u0634\u063a\u064a\u0644 \u0641\u064a\u0633\u0628\u0648\u0643 \u0644\u062a\u0637\u0628\u064a\u0642 \u0627\u0644\u062a\u063a\u064a\u064a\u0631\u0627\u062a. by Mody" : nil;
+- (void)mdf_close {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
-- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return _rows[s].count; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)t {
+    return _sections.count;
+}
+- (NSString *)tableView:(UITableView *)t titleForHeaderInSection:(NSInteger)s {
+    return _sections[s];
+}
+- (NSString *)tableView:(UITableView *)t titleForFooterInSection:(NSInteger)s {
+    if (s == (NSInteger)_sections.count - 1) return @"أعد تشغيل فيسبوك لتطبيق التغييرات. by Mody";
+    return nil;
+}
+- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s {
+    return _rows[s].count;
+}
 - (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
     UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
     NSArray *row = _rows[ip.section][ip.row];
@@ -206,41 +193,46 @@ static BOOL MDFShouldBlockRequest(NSURLRequest *req) {
 }
 @end
 
-@interface UITabBar (MDF)
-- (void)mdf_longPress:(UILongPressGestureRecognizer *)g;
-@end
-
 static UIViewController *MDFTopController(void) {
     UIWindow *win = nil;
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)s).windows) { if (w.isKeyWindow) { win = w; break; } }
+        for (UIWindow *w in ((UIWindowScene *)s).windows) {
+            if (w.isKeyWindow) { win = w; break; }
+        }
     }
     UIViewController *vc = win.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
 
+static const char kMDFGestureKey = 0;
+
 %hook UITabBar
 - (void)didMoveToWindow {
     %orig;
     if (!self.window) return;
-    static const char kMDFKey = 0;
-    if (objc_getAssociatedObject(self, &kMDFKey)) return;
+    if (objc_getAssociatedObject(self, &kMDFGestureKey)) return;
     UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(mdf_longPress:)];
     lp.minimumPressDuration = 0.8;
     lp.cancelsTouchesInView = NO;
     [self addGestureRecognizer:lp];
-    objc_setAssociatedObject(self, &kMDFKey, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, &kMDFGestureKey, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
+
 %new
 - (void)mdf_longPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
     UIViewController *top = MDFTopController();
-    if (!top || [top isKindOfClass:[UINavigationController class]] && [((UINavigationController *)top).topViewController isKindOfClass:[MDFSettingsController class]]) return;
+    if (!top) return;
+    if ([top isKindOfClass:[UINavigationController class]]) {
+        UIViewController *inner = ((UINavigationController *)top).topViewController;
+        if ([inner isKindOfClass:[MDFSettingsController class]]) return;
+    }
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[MDFSettingsController new]];
     nav.view.semanticContentAttribute = UISemanticContentAttributeForceRightToLeft;
-    [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium].impactOccurred;
+    UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [fb impactOccurred];
     [top presentViewController:nav animated:YES completion:nil];
 }
 %end
