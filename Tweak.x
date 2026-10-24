@@ -23,6 +23,10 @@ static BOOL gStoriesManualSeen = YES;
 static BOOL gStoriesNoAuto = YES;
 static BOOL gConfirmingLike = NO;
 
+// --- URL capture via AVPlayer hook ---
+static NSMutableArray<NSURL *> *gCapturedURLs = nil;
+static NSURL *gLastCapturedURL = nil;
+
 static UIWindow *gSettingsWindow = nil;
 
 static void MFSavePrefs(void) {
@@ -88,23 +92,26 @@ static UIViewController *MFTopVC(void) {
 }
 
 static void MFToast(NSString *msg) {
-    UIWindow *w = MFKeyWindow();
-    if (!w) return;
-    UILabel *lab = [[UILabel alloc] init];
-    lab.text = msg;
-    lab.textColor = UIColor.whiteColor;
-    lab.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
-    lab.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-    lab.textAlignment = NSTextAlignmentCenter;
-    lab.numberOfLines = 0;
-    lab.layer.cornerRadius = 10;
-    lab.clipsToBounds = YES;
-    CGFloat width = w.bounds.size.width - 48;
-    CGSize sz = [lab sizeThatFits:CGSizeMake(width, 120)];
-    lab.frame = CGRectMake(24, w.bounds.size.height - 150, width, MAX(36, sz.height + 14));
-    [w addSubview:lab];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [UIView animateWithDuration:0.25 animations:^{ lab.alpha = 0; } completion:^(BOOL f){ [lab removeFromSuperview]; }];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *w = MFKeyWindow();
+        if (!w) return;
+        UILabel *lab = [[UILabel alloc] init];
+        lab.text = msg;
+        lab.textColor = UIColor.whiteColor;
+        lab.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
+        lab.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+        lab.textAlignment = NSTextAlignmentCenter;
+        lab.numberOfLines = 0;
+        lab.layer.cornerRadius = 10;
+        lab.clipsToBounds = YES;
+        CGFloat width = w.bounds.size.width - 48;
+        CGSize sz = [lab sizeThatFits:CGSizeMake(width, 120)];
+        lab.frame = CGRectMake(24, w.bounds.size.height - 150, width, MAX(36, sz.height + 14));
+        [w addSubview:lab];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [UIView animateWithDuration:0.25 animations:^{ lab.alpha = 0; }
+                            completion:^(BOOL f){ [lab removeFromSuperview]; }];
+        });
     });
 }
 
@@ -159,61 +166,81 @@ static void MFCollapse(UIView *v) {
     v.frame = f;
 }
 
-static NSURL *MFPlayerURLInView(UIView *view, int depth) {
-    if (!view || depth > 12) return nil;
-    if ([view.layer isKindOfClass:[AVPlayerLayer class]]) {
-        AVPlayer *p = ((AVPlayerLayer *)view.layer).player;
-        AVAsset *a = p.currentItem.asset;
-        if ([a isKindOfClass:[AVURLAsset class]]) return ((AVURLAsset *)a).URL;
-    }
-    for (CALayer *sub in view.layer.sublayers) {
-        if ([sub isKindOfClass:[AVPlayerLayer class]]) {
-            AVPlayer *p = ((AVPlayerLayer *)sub).player;
-            AVAsset *a = p.currentItem.asset;
-            if ([a isKindOfClass:[AVURLAsset class]]) return ((AVURLAsset *)a).URL;
+// --- New URL capture: uses hooked AVPlayer ---
+static void MFCaptureURL(NSURL *url) {
+    if (!url) return;
+    NSString *scheme = url.scheme.lowercaseString;
+    // فقط HTTP/HTTPS URLs (مش file:// أو data://)
+    if (![scheme hasPrefix:@"http"]) return;
+    NSString *absStr = url.absoluteString;
+    // فيسبوك CDN patterns
+    if (![absStr containsString:@"facebook"] &&
+        ![absStr containsString:@"fbcdn"] &&
+        ![absStr containsString:@"cdninstagram"] &&
+        ![absStr containsString:@"video"] &&
+        ![absStr containsString:@".mp4"] &&
+        ![absStr containsString:@".m3u8"]) return;
+
+    @synchronized(gCapturedURLs) {
+        if (![gCapturedURLs containsObject:url]) {
+            [gCapturedURLs insertObject:url atIndex:0];
+            if (gCapturedURLs.count > 20) [gCapturedURLs removeLastObject];
         }
+        gLastCapturedURL = url;
     }
-    for (UIView *sub in view.subviews) {
-        NSURL *u = MFPlayerURLInView(sub, depth + 1);
-        if (u) return u;
-    }
-    return nil;
+    NSLog(@"[MooDfacebook] Captured URL: %@", absStr);
 }
 
-static NSURL *MFFindMediaURL(void) {
-    for (UIWindow *w in MFWindows()) {
-        NSURL *u = MFPlayerURLInView(w, 0);
-        if (u) return u;
+static NSURL *MFGetBestURL(void) {
+    @synchronized(gCapturedURLs) {
+        return gLastCapturedURL ?: gCapturedURLs.firstObject;
     }
-    return nil;
 }
 
 static void MFSaveURL(NSURL *url) {
-    if (!url) { MFToast(@"No media URL"); return; }
+    if (!url) {
+        MFToast(@"❌ No media URL — play the video first");
+        return;
+    }
+    MFToast(@"⬇️ Downloading...");
     [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus st) {
         if (st != PHAuthorizationStatusAuthorized && st != PHAuthorizationStatusLimited) {
-            dispatch_async(dispatch_get_main_queue(), ^{ MFToast(@"Photos denied"); });
+            dispatch_async(dispatch_get_main_queue(), ^{ MFToast(@"❌ Photos access denied"); });
             return;
         }
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            NSData *data = [NSData dataWithContentsOfURL:url];
-            if (!data.length && url.isFileURL) data = [NSData dataWithContentsOfFile:url.path];
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+            [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)" forHTTPHeaderField:@"User-Agent"];
+            [req setValue:@"https://www.facebook.com/" forHTTPHeaderField:@"Referer"];
+
+            __block NSData *data = nil;
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+                completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                    data = d;
+                    dispatch_semaphore_signal(sem);
+                }];
+            [task resume];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC));
+
             if (!data.length) {
-                dispatch_async(dispatch_get_main_queue(), ^{ MFToast(@"Download failed"); });
+                dispatch_async(dispatch_get_main_queue(), ^{ MFToast(@"❌ Download failed"); });
                 return;
             }
             NSString *ext = url.pathExtension.lowercaseString;
-            BOOL img = [@[ @"jpg", @"jpeg", @"png", @"heic" ] containsObject:ext];
-            NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"mf_%@.%@", NSUUID.UUID.UUIDString, img ? @"jpg" : @"mp4"]];
+            if (!ext.length) ext = @"mp4";
+            BOOL isImg = [@[@"jpg",@"jpeg",@"png",@"heic",@"webp"] containsObject:ext];
+            NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                             [NSString stringWithFormat:@"mf_%@.%@", NSUUID.UUID.UUIDString, isImg ? @"jpg" : @"mp4"]];
             [data writeToFile:tmp atomically:YES];
             [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
                 NSURL *fu = [NSURL fileURLWithPath:tmp];
-                if (img) [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:fu];
-                else [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fu];
+                if (isImg) [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:fu];
+                else       [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fu];
             } completionHandler:^(BOOL ok, NSError *err) {
                 [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    MFToast(ok ? @"Saved to Photos" : @"Save failed");
+                    MFToast(ok ? @"✅ Saved to Photos!" : @"❌ Save failed");
                 });
             }];
         });
@@ -222,8 +249,7 @@ static void MFSaveURL(NSURL *url) {
 
 static void MFDownload(void) {
     if (!gEnabled) return;
-    if (!(gDownloadMedia || gReelsLongPressDL || gStoriesDownload || gReelsDownloadBtn)) return;
-    MFSaveURL(MFFindMediaURL());
+    MFSaveURL(MFGetBestURL());
 }
 
 #pragma mark - Settings
@@ -241,37 +267,38 @@ static void MFDownload(void) {
 
     self.sections = @[
         @{ @"t": @"General", @"r": @[
-            @{ @"k": @"enabled", @"l": @"Enable MooDfacebook" },
-            @{ @"k": @"removeAds", @"l": @"Remove Sponsored Ads" },
-            @{ @"k": @"removePYMK", @"l": @"Remove People You May Know" },
+            @{ @"k": @"enabled",             @"l": @"Enable MooDfacebook" },
+            @{ @"k": @"removeAds",           @"l": @"Remove Sponsored Ads" },
+            @{ @"k": @"removePYMK",          @"l": @"Remove People You May Know" },
             @{ @"k": @"removeReelsCarousel", @"l": @"Remove Reels Carousel" },
-            @{ @"k": @"confirmPostLike", @"l": @"Confirm Post Like" },
-            @{ @"k": @"downloadMedia", @"l": @"Download Media (long-press)" },
+            @{ @"k": @"confirmPostLike",     @"l": @"Confirm Post Like" },
+            @{ @"k": @"downloadMedia",       @"l": @"Download Media (long-press)" },
         ]},
         @{ @"t": @"Reels", @"r": @[
-            @{ @"k": @"reelsDownloadBtn", @"l": @"Download Button on Reels" },
-            @{ @"k": @"reelsHideOverlay", @"l": @"Hide Reels Overlay" },
-            @{ @"k": @"confirmReelsLike", @"l": @"Confirm Reels Like" },
-            @{ @"k": @"reelsLongPressDL", @"l": @"Long-press Download Reels" },
+            @{ @"k": @"reelsDownloadBtn",  @"l": @"Download Button on Reels" },
+            @{ @"k": @"reelsHideOverlay",  @"l": @"Hide Reels Overlay" },
+            @{ @"k": @"confirmReelsLike",  @"l": @"Confirm Reels Like" },
+            @{ @"k": @"reelsLongPressDL",  @"l": @"Long-press Download Reels" },
         ]},
         @{ @"t": @"Stories", @"r": @[
-            @{ @"k": @"storiesDownload", @"l": @"Download Stories" },
-            @{ @"k": @"storiesAnon", @"l": @"Watch Anonymously" },
-            @{ @"k": @"storiesManualSeen", @"l": @"Manual Mark as Seen" },
-            @{ @"k": @"storiesNoAuto", @"l": @"Disable Auto-Advance" },
+            @{ @"k": @"storiesDownload",    @"l": @"Download Stories" },
+            @{ @"k": @"storiesAnon",        @"l": @"Watch Anonymously" },
+            @{ @"k": @"storiesManualSeen",  @"l": @"Manual Mark as Seen" },
+            @{ @"k": @"storiesNoAuto",      @"l": @"Disable Auto-Advance" },
         ]},
     ];
 
     UINavigationBar *bar = [[UINavigationBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 56)];
     bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    UINavigationItem *item = [[UINavigationItem alloc] initWithTitle:@"MooDfacebook"];
-    item.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
+    UINavigationItem *item = [[UINavigationItem alloc] initWithTitle:@"MooDfacebook ⚙️"];
+    item.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                                            target:self action:@selector(close)];
     bar.items = @[item];
     [self.view addSubview:bar];
 
     self.table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
     self.table.dataSource = self;
-    self.table.delegate = self;
+    self.table.delegate   = self;
     self.table.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:self.table];
     [NSLayoutConstraint activateConstraints:@[
@@ -287,38 +314,38 @@ static void MFDownload(void) {
 - (NSString *)tableView:(UITableView *)t titleForHeaderInSection:(NSInteger)s { return self.sections[s][@"t"]; }
 
 - (BOOL)valueForKeyName:(NSString *)key {
-    if ([key isEqualToString:@"enabled"]) return gEnabled;
-    if ([key isEqualToString:@"removeAds"]) return gRemoveAds;
-    if ([key isEqualToString:@"removePYMK"]) return gRemovePYMK;
+    if ([key isEqualToString:@"enabled"])             return gEnabled;
+    if ([key isEqualToString:@"removeAds"])           return gRemoveAds;
+    if ([key isEqualToString:@"removePYMK"])          return gRemovePYMK;
     if ([key isEqualToString:@"removeReelsCarousel"]) return gRemoveReelsCarousel;
-    if ([key isEqualToString:@"confirmPostLike"]) return gConfirmPostLike;
-    if ([key isEqualToString:@"downloadMedia"]) return gDownloadMedia;
-    if ([key isEqualToString:@"reelsDownloadBtn"]) return gReelsDownloadBtn;
-    if ([key isEqualToString:@"reelsHideOverlay"]) return gReelsHideOverlay;
-    if ([key isEqualToString:@"confirmReelsLike"]) return gConfirmReelsLike;
-    if ([key isEqualToString:@"reelsLongPressDL"]) return gReelsLongPressDL;
-    if ([key isEqualToString:@"storiesDownload"]) return gStoriesDownload;
-    if ([key isEqualToString:@"storiesAnon"]) return gStoriesAnon;
-    if ([key isEqualToString:@"storiesManualSeen"]) return gStoriesManualSeen;
-    if ([key isEqualToString:@"storiesNoAuto"]) return gStoriesNoAuto;
+    if ([key isEqualToString:@"confirmPostLike"])     return gConfirmPostLike;
+    if ([key isEqualToString:@"downloadMedia"])       return gDownloadMedia;
+    if ([key isEqualToString:@"reelsDownloadBtn"])    return gReelsDownloadBtn;
+    if ([key isEqualToString:@"reelsHideOverlay"])    return gReelsHideOverlay;
+    if ([key isEqualToString:@"confirmReelsLike"])    return gConfirmReelsLike;
+    if ([key isEqualToString:@"reelsLongPressDL"])    return gReelsLongPressDL;
+    if ([key isEqualToString:@"storiesDownload"])     return gStoriesDownload;
+    if ([key isEqualToString:@"storiesAnon"])         return gStoriesAnon;
+    if ([key isEqualToString:@"storiesManualSeen"])   return gStoriesManualSeen;
+    if ([key isEqualToString:@"storiesNoAuto"])       return gStoriesNoAuto;
     return NO;
 }
 
 - (void)setValue:(BOOL)on forKeyName:(NSString *)key {
-    if ([key isEqualToString:@"enabled"]) gEnabled = on;
-    else if ([key isEqualToString:@"removeAds"]) gRemoveAds = on;
-    else if ([key isEqualToString:@"removePYMK"]) gRemovePYMK = on;
+    if ([key isEqualToString:@"enabled"])             gEnabled = on;
+    else if ([key isEqualToString:@"removeAds"])           gRemoveAds = on;
+    else if ([key isEqualToString:@"removePYMK"])          gRemovePYMK = on;
     else if ([key isEqualToString:@"removeReelsCarousel"]) gRemoveReelsCarousel = on;
-    else if ([key isEqualToString:@"confirmPostLike"]) gConfirmPostLike = on;
-    else if ([key isEqualToString:@"downloadMedia"]) gDownloadMedia = on;
-    else if ([key isEqualToString:@"reelsDownloadBtn"]) gReelsDownloadBtn = on;
-    else if ([key isEqualToString:@"reelsHideOverlay"]) gReelsHideOverlay = on;
-    else if ([key isEqualToString:@"confirmReelsLike"]) gConfirmReelsLike = on;
-    else if ([key isEqualToString:@"reelsLongPressDL"]) gReelsLongPressDL = on;
-    else if ([key isEqualToString:@"storiesDownload"]) gStoriesDownload = on;
-    else if ([key isEqualToString:@"storiesAnon"]) gStoriesAnon = on;
-    else if ([key isEqualToString:@"storiesManualSeen"]) gStoriesManualSeen = on;
-    else if ([key isEqualToString:@"storiesNoAuto"]) gStoriesNoAuto = on;
+    else if ([key isEqualToString:@"confirmPostLike"])     gConfirmPostLike = on;
+    else if ([key isEqualToString:@"downloadMedia"])       gDownloadMedia = on;
+    else if ([key isEqualToString:@"reelsDownloadBtn"])    gReelsDownloadBtn = on;
+    else if ([key isEqualToString:@"reelsHideOverlay"])    gReelsHideOverlay = on;
+    else if ([key isEqualToString:@"confirmReelsLike"])    gConfirmReelsLike = on;
+    else if ([key isEqualToString:@"reelsLongPressDL"])    gReelsLongPressDL = on;
+    else if ([key isEqualToString:@"storiesDownload"])     gStoriesDownload = on;
+    else if ([key isEqualToString:@"storiesAnon"])         gStoriesAnon = on;
+    else if ([key isEqualToString:@"storiesManualSeen"])   gStoriesManualSeen = on;
+    else if ([key isEqualToString:@"storiesNoAuto"])       gStoriesNoAuto = on;
     MFSavePrefs();
 }
 
@@ -328,7 +355,7 @@ static void MFDownload(void) {
     cell.textLabel.text = row[@"l"];
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *sw = [[UISwitch alloc] init];
-    sw.on = [self valueForKeyName:row[@"k"]];
+    sw.on  = [self valueForKeyName:row[@"k"]];
     sw.tag = ip.section * 100 + ip.row;
     [sw addTarget:self action:@selector(toggle:) forControlEvents:UIControlEventValueChanged];
     cell.accessoryView = sw;
@@ -337,7 +364,7 @@ static void MFDownload(void) {
 
 - (void)toggle:(UISwitch *)sw {
     NSInteger section = sw.tag / 100;
-    NSInteger row = sw.tag % 100;
+    NSInteger row     = sw.tag % 100;
     NSString *key = self.sections[section][@"r"][row][@"k"];
     [self setValue:sw.on forKeyName:key];
 }
@@ -394,11 +421,11 @@ static void MFEnsureDLButton(UIView *host) {
     if ([host viewWithTag:kDLBtnTag]) return;
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     btn.tag = kDLBtnTag;
-    btn.frame = CGRectMake(host.bounds.size.width - 52, host.bounds.size.height * 0.5, 42, 42);
+    btn.frame = CGRectMake(host.bounds.size.width - 56, host.bounds.size.height * 0.45, 46, 46);
     btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-    btn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
-    btn.layer.cornerRadius = 21;
-    [btn setTitle:@"↓" forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+    btn.layer.cornerRadius = 23;
+    [btn setTitle:@"⬇" forState:UIControlStateNormal];
     [btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     btn.titleLabel.font = [UIFont boldSystemFontOfSize:20];
     [btn addTarget:[MFActionTarget shared] action:@selector(download) forControlEvents:UIControlEventTouchUpInside];
@@ -409,7 +436,8 @@ static void MFAttachLongPress(UIView *view) {
     if (!view) return;
     static const void *kKey = &kKey;
     if (objc_getAssociatedObject(view, kKey)) return;
-    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:[MFActionTarget shared] action:@selector(mediaLongPress:)];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:[MFActionTarget shared] action:@selector(mediaLongPress:)];
     lp.minimumPressDuration = 0.55;
     [view addGestureRecognizer:lp];
     objc_setAssociatedObject(view, kKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -417,13 +445,61 @@ static void MFAttachLongPress(UIView *view) {
 
 #pragma mark - Hooks
 
+// Hook AVPlayer لالتقاط URL لحظة تحميل الفيديو
+%hook AVPlayer
+- (void)replaceCurrentItemWithPlayerItem:(AVPlayerItem *)item {
+    %orig;
+    if (!gEnabled) return;
+    if (!item) return;
+    AVAsset *asset = item.asset;
+    if ([asset isKindOfClass:[AVURLAsset class]]) {
+        MFCaptureURL(((AVURLAsset *)asset).URL);
+    }
+}
+
+- (instancetype)initWithPlayerItem:(AVPlayerItem *)item {
+    self = %orig;
+    if (self && item) {
+        AVAsset *asset = item.asset;
+        if ([asset isKindOfClass:[AVURLAsset class]]) {
+            MFCaptureURL(((AVURLAsset *)asset).URL);
+        }
+    }
+    return self;
+}
+
+- (instancetype)initWithURL:(NSURL *)URL {
+    self = %orig;
+    if (self && URL) {
+        MFCaptureURL(URL);
+    }
+    return self;
+}
+%end
+
+// Hook AVPlayerItem أيضاً للإحاطة الكاملة
+%hook AVPlayerItem
+- (instancetype)initWithURL:(NSURL *)URL {
+    self = %orig;
+    if (self && URL) MFCaptureURL(URL);
+    return self;
+}
+- (instancetype)initWithAsset:(AVAsset *)asset {
+    self = %orig;
+    if (self && [asset isKindOfClass:[AVURLAsset class]]) {
+        MFCaptureURL(((AVURLAsset *)asset).URL);
+    }
+    return self;
+}
+%end
+
 %hook UICollectionViewCell
 - (void)layoutSubviews {
     %orig;
     if (!gEnabled) return;
     if (self.bounds.size.height < 48) return;
-    if (gRemoveAds && MFScanLabels(self, 0, MFIsSponsored)) { MFCollapse(self); self.contentView.hidden = YES; return; }
-    if (gRemovePYMK && MFScanLabels(self, 0, MFIsPYMK)) { MFCollapse(self); self.contentView.hidden = YES; return; }
+    if (gRemoveAds    && MFScanLabels(self, 0, MFIsSponsored))    { MFCollapse(self); self.contentView.hidden = YES; return; }
+    if (gRemovePYMK   && MFScanLabels(self, 0, MFIsPYMK))         { MFCollapse(self); self.contentView.hidden = YES; return; }
     if (gRemoveReelsCarousel && MFScanLabels(self, 0, MFIsReelsLabel)) { MFCollapse(self); self.contentView.hidden = YES; return; }
 }
 %end
@@ -433,8 +509,8 @@ static void MFAttachLongPress(UIView *view) {
     %orig;
     if (!gEnabled) return;
     if (self.bounds.size.height < 40) return;
-    if (gRemoveAds && MFScanLabels(self, 0, MFIsSponsored)) { MFCollapse(self); self.contentView.hidden = YES; return; }
-    if (gRemovePYMK && MFScanLabels(self, 0, MFIsPYMK)) { MFCollapse(self); self.contentView.hidden = YES; return; }
+    if (gRemoveAds  && MFScanLabels(self, 0, MFIsSponsored)) { MFCollapse(self); self.contentView.hidden = YES; return; }
+    if (gRemovePYMK && MFScanLabels(self, 0, MFIsPYMK))      { MFCollapse(self); self.contentView.hidden = YES; return; }
 }
 %end
 
@@ -452,10 +528,7 @@ static void MFAttachLongPress(UIView *view) {
 
 %hook UIControl
 - (void)sendAction:(SEL)action to:(id)target forEvent:(UIEvent *)event {
-    if (gConfirmingLike) {
-        %orig;
-        return;
-    }
+    if (gConfirmingLike) { %orig; return; }
     if (gEnabled && [self isKindOfClass:[UIControl class]]) {
         NSString *label = self.accessibilityLabel;
         if ([self isKindOfClass:[UIButton class]]) {
@@ -468,10 +541,11 @@ static void MFAttachLongPress(UIView *view) {
             BOOL nearBottom = (f.origin.y > UIScreen.mainScreen.bounds.size.height * 0.55);
             BOOL needConfirm = nearBottom ? gConfirmReelsLike : gConfirmPostLike;
             if (needConfirm) {
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"MooDfacebook" message:@"Confirm like?" preferredStyle:UIAlertControllerStyleAlert];
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"MooDfacebook"
+                    message:@"Confirm like?" preferredStyle:UIAlertControllerStyleAlert];
                 __weak UIControl *weakSelf = self;
                 [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-                [alert addAction:[UIAlertAction actionWithTitle:@"Like" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                [alert addAction:[UIAlertAction actionWithTitle:@"Like ❤️" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                     gConfirmingLike = YES;
                     [weakSelf sendAction:action to:target forEvent:event];
                     gConfirmingLike = NO;
@@ -491,7 +565,8 @@ static void MFAttachLongPress(UIView *view) {
     if (!self.window) return;
     static const void *kTab = &kTab;
     if (objc_getAssociatedObject(self, kTab)) return;
-    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:[MFActionTarget shared] action:@selector(tabLongPress:)];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:[MFActionTarget shared] action:@selector(tabLongPress:)];
     lp.minimumPressDuration = 0.5;
     [self addGestureRecognizer:lp];
     objc_setAssociatedObject(self, kTab, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -511,7 +586,8 @@ static void MFAttachLongPress(UIView *view) {
             for (UIView *sub in self.view.subviews) {
                 if (sub.tag == kDLBtnTag) continue;
                 CGRect f = sub.frame;
-                if ((f.origin.y > h * 0.65 && f.size.height < h * 0.4) || (f.origin.x > w * 0.7 && f.size.width < w * 0.35)) {
+                if ((f.origin.y > h * 0.65 && f.size.height < h * 0.4) ||
+                    (f.origin.x > w  * 0.7  && f.size.width  < w * 0.35)) {
                     sub.alpha = 0.08;
                     sub.userInteractionEnabled = NO;
                 }
@@ -534,7 +610,8 @@ static void MFAttachLongPress(UIView *view) {
 %end
 
 %ctor {
+    gCapturedURLs = [NSMutableArray array];
     MFLoadPrefs();
     if (![[NSFileManager defaultManager] fileExistsAtPath:kPrefsPath]) MFSavePrefs();
-    NSLog(@"[MooDfacebook] v0.2.1 loaded — long-press tab bar for settings");
+    NSLog(@"[MooDfacebook] v0.3.0 loaded — AVPlayer hooked, long-press tab for settings");
 }
