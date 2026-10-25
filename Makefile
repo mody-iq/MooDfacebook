@@ -5,7 +5,7 @@ ARCHS = arm64e
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = MooDfacebook
-MooDfacebook_FILES = Tweak.x
+MooDfacebook_FILES = Tweak.x Discovery.m
 MooDfacebook_CFLAGS = -fobjc-arc
 MooDfacebook_FRAMEWORKS = UIKit Foundation AVFoundation
 
