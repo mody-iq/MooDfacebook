@@ -1,9 +1,0 @@
-{
-	entry = {
-		bundle = MooDfacebookPrefs;
-		cell = PSLinkCell;
-		icon = "icon.png";
-		isController = 1;
-		label = MooDfacebook;
-	};
-}
