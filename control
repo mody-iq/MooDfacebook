@@ -1,6 +1,6 @@
 Package: com.mody-iq.moodfacebook
 Name: MooDfacebook
-Version: 2.0.0
+Version: 2.0.1
 Architecture: iphoneos-arm64e
 Description: Facebook enhancement tweak for RootHide: removes sponsored posts, hides People You May Know and the Reels carousel, confirms likes, downloads photos/videos/Reels/Stories on long press or via button, hides the Reels overlay, and lets you watch Stories without leaving a seen receipt.
 Maintainer: mody-iq

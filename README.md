@@ -38,7 +38,17 @@ Two triggers, both deterministic:
 The previous long-press trigger was removed: Facebook installs its own
 long-press recognisers on the feed and they win the gesture arena.
 
-## Bug fixes in 2.0.0
+## Bug fixes
+
+**Facebook was frozen: no scrolling or tapping while the floating button was
+shown.** A transparent overlay window was swallowing every touch. UIKit asks the
+*window* for the hit view, and `UIWindow` inherits `UIView`'s `hitTest:`, which
+returns the window itself when no subview claims the point. So touches on the
+button worked, but every other touch was delivered to the overlay window instead
+of to Facebook, whose own window below never saw the event. The overlay is now an
+`MDFPassthroughWindow` that returns `nil` for itself and for its root view, so
+UIKit moves on to the window underneath. The same window is also kept out of the
+key-window slot, so it cannot take keyboard focus from Facebook.
 
 **Confirm like used to flash and disappear.** The alert is now presented on the
 main thread from a `UIWindow` owned by the tweak, so a Facebook view-controller

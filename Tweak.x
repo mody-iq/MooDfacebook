@@ -40,7 +40,7 @@
 
 #pragma mark - Constants
 
-#define MDF_VERSION @"2.0.0"
+#define MDF_VERSION @"2.0.1"
 
 static NSString *const kMDFSuite = @"com.mody-iq.moodfacebook";
 static NSString *const kMDFLongPressName = @"mdf.longpress";
@@ -410,6 +410,33 @@ static void MDFHideOverlayControlsDeferred(UIView *view) {
 }
 @end
 
+// A transparent overlay window must not swallow touches. UIKit asks the
+// *window* for the hit view, and UIWindow inherits UIView's hitTest:, which
+// returns the window itself when no subview claims the point. That is what
+// froze Facebook: every touch outside the button was delivered to this window,
+// which has nothing to do with it, so Facebook's own window below never saw the
+// event. Returning nil here makes UIKit move on to the next window down.
+//
+// The window is also kept out of the key-window slot by default: an overlay
+// that becomes key would take keyboard focus away from Facebook. The alert
+// window opts back in via mdfCanBecomeKey.
+@interface MDFPassthroughWindow : UIWindow
+@property (nonatomic, assign) BOOL mdfCanBecomeKey;
+@end
+
+@implementation MDFPassthroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self) return nil;
+    if (hit == self.rootViewController.view) return nil;
+    return hit;
+}
+
+- (BOOL)canBecomeKeyWindow {
+    return self.mdfCanBecomeKey;
+}
+@end
+
 @interface MDFFloatingRootViewController : UIViewController
 @end
 
@@ -570,7 +597,7 @@ static void MDFSetupUI(void) {
     }
     if (!scene) return; // App not foregrounded yet; retried later.
 
-    UIWindow *window = [[UIWindow alloc] initWithWindowScene:scene];
+    MDFPassthroughWindow *window = [[MDFPassthroughWindow alloc] initWithWindowScene:scene];
     window.frame = scene.coordinateSpace.bounds;
     window.windowLevel = UIWindowLevelAlert - 1;
     window.backgroundColor = UIColor.clearColor;
@@ -877,8 +904,11 @@ static void MDFPresentSettings(void) {
 @end
 
 @implementation MDFAlertRootViewController
-- (void)viewDidLoad {
-    [super viewDidLoad];
+// Passthrough root as well, so a transparent alert window can never trap
+// touches if the alert itself fails to present. The alert's own view is a
+// subview and still receives touches normally.
+- (void)loadView {
+    self.view = [[MDFPassthroughView alloc] initWithFrame:UIScreen.mainScreen.bounds];
     self.view.backgroundColor = UIColor.clearColor;
 }
 @end
@@ -946,7 +976,10 @@ static void MDFShowConfirmLike(dispatch_block_t onConfirm) {
         }
         if (!scene) { gMDFConfirmInFlight = NO; onConfirm(); return; }
 
-        UIWindow *window = [[UIWindow alloc] initWithWindowScene:scene];
+        // Passthrough window as well: if the alert ever fails to present, this
+        // transparent window must not become a touch blocker over Facebook.
+        MDFPassthroughWindow *window = [[MDFPassthroughWindow alloc] initWithWindowScene:scene];
+        window.mdfCanBecomeKey = YES;
         window.frame = scene.coordinateSpace.bounds;
         window.windowLevel = UIWindowLevelAlert;
         window.backgroundColor = UIColor.clearColor;
