@@ -14,8 +14,9 @@
 //  10. Copy link instead of opening the share sheet    shareAfterDownload
 //      (video downloads only; image downloads always use the share sheet)
 //  11. Floating gear button                            showFloatingButton
-//  12. Master switch                                   enabled
-//  13. Verbose logging                                 debug
+//  12. Download button on media                        showDownloadButton
+//  13. Master switch                                   enabled
+//  14. Verbose logging                                 debug
 //
 // Preferences live in the NSUserDefaults suite com.mody-iq.moodfacebook, so the
 // tweak keeps working (with safe defaults) even if no preference bundle is
@@ -40,10 +41,11 @@
 
 #pragma mark - Constants
 
-#define MDF_VERSION @"2.0.1"
+#define MDF_VERSION @"2.1.0"
 
 static NSString *const kMDFSuite = @"com.mody-iq.moodfacebook";
 static NSString *const kMDFLongPressName = @"mdf.longpress";
+static NSString *const kMDFDownloadButtonIdentifier = @"mdf.download.button";
 static NSString *const kMDFScopeReels = @"reels";
 static NSString *const kMDFScopeStories = @"stories";
 static NSString *const kMDFScopeMedia = @"media";
@@ -88,6 +90,7 @@ static void MDFRegisterDefaults(void) {
         @"incognitoStories": @YES,
         @"shareAfterDownload": @YES,
         @"showFloatingButton": @YES,
+        @"showDownloadButton": @YES,
         @"debug": @NO,
     };
     NSUserDefaults *suite = MDFSuiteDefaults();
@@ -146,6 +149,59 @@ static NSArray<NSString *> *MDFReelsMarkers(void) {
     return markers;
 }
 
+// Accessibility identifiers Facebook puts on sponsored / suggested cells. These
+// are far more stable than visible text and are matched against the whole cell.
+static NSArray<NSString *> *MDFAdIdentifierMarkers(void) {
+    static NSArray *markers;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        markers = @[@"sponsored", @"sponsor", @"paid_partnership", @"suggested_post",
+                    @"suggested_for_you", @"suggestedfor", @"promoted", @"ad_", @"_ad",
+                    @"ads_", @"_ads", @"branded_content", @"boosted"];
+    });
+    return markers;
+}
+
+// Class names that mark a cell (or a wrapper) as an ad container.
+static NSArray<NSString *> *MDFAdClassMarkers(void) {
+    static NSArray *markers;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        markers = @[@"sponsored", @"sponsorcontent", @"sponsoredcontent", @"paidpartnership",
+                    @"brandedcontent", @"promotedpost", @"adsstory", @"adspost"];
+    });
+    return markers;
+}
+
+// Class names that mark the feed's Reels shelf / carousel. Deliberately narrow:
+// matching the word "reel" anywhere would also catch the Reels viewer and
+// ordinary video posts.
+static NSArray<NSString *> *MDFReelsShelfClassMarkers(void) {
+    static NSArray *markers;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        markers = @[@"reelsshelf", @"reelcarousel", @"reelscarousel", @"reelstray",
+                    @"reelunit", @"reelsunit", @"reelsfeedunit", @"reelsattachment",
+                    @"reelsvideoshelf", @"shortvideosshelf", @"reelsshortvideos"];
+    });
+    return markers;
+}
+
+// YES if the view or any ancestor's class name matches one of the markers.
+static BOOL MDFViewMatchesClassNames(UIView *view, NSArray<NSString *> *markers) {
+    UIView *current = view;
+    NSUInteger hops = 0;
+    while (current && hops < 6) {
+        NSString *className = NSStringFromClass([current class]).lowercaseString;
+        for (NSString *marker in markers) {
+            if ([className containsString:marker]) return YES;
+        }
+        current = current.superview;
+        hops++;
+    }
+    return NO;
+}
+
 // Words that appear on Reels/Stories control widgets. Only used to classify a
 // view as a control when the view is not itself a UIControl.
 static NSArray<NSString *> *MDFOverlayControlMarkers(void) {
@@ -189,12 +245,69 @@ static void MDFCollectText(UIView *view, NSMutableArray<NSString *> *out, NSUInt
     for (UIView *sub in view.subviews) MDFCollectText(sub, out, depth + 1);
 }
 
-static BOOL MDFViewMatchesMarkers(UIView *view, NSArray<NSString *> *markers) {
+// A full-subtree text scan is right for a whole feed cell, but wrong for a
+// single header: a post whose *body* happens to contain the word "sponsored"
+// would be hidden. For headers we only look at the top few levels, which is
+// where Facebook renders the author line and the "Sponsored" badge.
+static BOOL MDFCollectTextShallow(UIView *view, NSMutableArray<NSString *> *out,
+                                  NSUInteger depth, NSUInteger maxDepth) {
+    if (!view || depth > maxDepth) return NO;
+    if (out.count > 60) return YES;
+    if (view.accessibilityLabel.length) [out addObject:view.accessibilityLabel];
+    if (view.accessibilityIdentifier.length) [out addObject:view.accessibilityIdentifier];
+    if ([view respondsToSelector:@selector(text)]) {
+        id text = [view performSelector:@selector(text)];
+        if ([text isKindOfClass:[NSString class]] && [text length]) [out addObject:text];
+    }
+    for (UIView *sub in view.subviews) {
+        if (MDFCollectTextShallow(sub, out, depth + 1, maxDepth)) return YES;
+    }
+    return NO;
+}
+
+static BOOL MDFViewShallowMatchesMarkers(UIView *view, NSArray<NSString *> *markers,
+                                         NSUInteger maxDepth) {
     if (!view) return NO;
     NSMutableArray<NSString *> *texts = [NSMutableArray array];
-    MDFCollectText(view, texts, 0);
+    MDFCollectTextShallow(view, texts, 0, maxDepth);
     for (NSString *text in texts) {
         if (MDFStringMatchesMarkers(text, markers)) return YES;
+    }
+    return NO;
+}
+
+// When debug logging is on, dump the strings a feed cell exposes. This is what
+// lets the markers be tuned against a real Facebook build without guessing:
+// the log shows the exact labels, accessibility labels and class names.
+static void MDFDumpCellText(UIView *cell) {
+    if (!MDFDebug()) return;
+    static NSUInteger dumped = 0;
+    if (dumped >= 40) return; // enough to tune the markers; avoid flooding
+    dumped++;
+
+    NSMutableArray<NSString *> *texts = [NSMutableArray array];
+    MDFCollectText(cell, texts, 0);
+    NSMutableArray<NSString *> *unique = [NSMutableArray array];
+    for (NSString *text in texts) {
+        if (![unique containsObject:text]) [unique addObject:text];
+    }
+    MDFLog(@"cell %@ text=%@", NSStringFromClass([cell class]), [unique componentsJoinedByString:@" | "]);
+}
+
+// Facebook marks sponsored cells with a stable accessibility identifier far
+// more often than with a visible label, so identifiers are matched on their own.
+static void MDFCollectIdentifiers(UIView *view, NSMutableArray<NSString *> *out, NSUInteger depth) {
+    if (!view || depth > 12 || out.count > 200) return;
+    if (view.accessibilityIdentifier.length) [out addObject:view.accessibilityIdentifier];
+    for (UIView *sub in view.subviews) MDFCollectIdentifiers(sub, out, depth + 1);
+}
+
+static BOOL MDFViewIdentifierMatchesMarkers(UIView *view, NSArray<NSString *> *markers) {
+    if (!view) return NO;
+    NSMutableArray<NSString *> *identifiers = [NSMutableArray array];
+    MDFCollectIdentifiers(view, identifiers, 0);
+    for (NSString *identifier in identifiers) {
+        if (MDFStringMatchesMarkers(identifier, markers)) return YES;
     }
     return NO;
 }
@@ -234,6 +347,26 @@ static AVPlayer *MDFPlayerInView(UIView *view) {
     return nil;
 }
 
+// Resolves the media URL for a player. Facebook plays HLS, and the asset is
+// frequently an AVComposition whose tracks carry the real URL, so all of these
+// sources are tried in order of reliability.
+static NSURL *MDFResolveAssetURL(AVAsset *asset) {
+    if (!asset) return nil;
+    if ([asset isKindOfClass:[AVURLAsset class]]) {
+        NSURL *url = ((AVURLAsset *)asset).URL;
+        if (url) return url;
+    }
+    // A composition has no URL of its own; look at the URL assets in its tracks.
+    if ([asset isKindOfClass:[AVComposition class]]) {
+        for (AVCompositionTrack *track in ((AVComposition *)asset).tracks) {
+            for (AVCompositionTrackSegment *segment in track.segments) {
+                if (segment.sourceURL) return segment.sourceURL;
+            }
+        }
+    }
+    return nil;
+}
+
 static NSURL *MDFVideoURLInView(UIView *view) {
     AVPlayer *player = MDFPlayerInView(view);
     if (!player) return nil;
@@ -241,9 +374,10 @@ static NSURL *MDFVideoURLInView(UIView *view) {
     // often a composition with no resolvable URL.
     NSURL *recorded = objc_getAssociatedObject(player, "mdf.mediaURL");
     if ([recorded isKindOfClass:[NSURL class]]) return recorded;
-    AVAsset *asset = player.currentItem.asset;
-    if ([asset isKindOfClass:[AVURLAsset class]]) return ((AVURLAsset *)asset).URL;
-    return nil;
+    AVPlayerItem *item = player.currentItem;
+    NSURL *fromItem = objc_getAssociatedObject(item, "mdf.mediaURL");
+    if ([fromItem isKindOfClass:[NSURL class]]) return fromItem;
+    return MDFResolveAssetURL(item.asset);
 }
 
 static UIImage *MDFImageInView(UIView *view) {
@@ -320,6 +454,9 @@ static NSArray<NSString *> *MDFOverlayExclusionMarkers(void) {
 }
 
 static BOOL MDFViewIsOverlayExcluded(UIView *view) {
+    // The tweak's own download button is a UIControl, so the control-widget
+    // pass would otherwise hide the very button we just added.
+    if ([view.accessibilityIdentifier isEqualToString:kMDFDownloadButtonIdentifier]) return YES;
     if (MDFStringMatchesMarkers(view.accessibilityLabel, MDFOverlayExclusionMarkers())) return YES;
     if (MDFStringMatchesMarkers(view.accessibilityIdentifier, MDFOverlayExclusionMarkers())) return YES;
     NSString *className = NSStringFromClass([view class]).lowercaseString;
@@ -376,7 +513,54 @@ static void MDFHideOverlayControls(UIView *view) {
 }
 
 // Controls can be added after the first pass (the player creates them lazily),
-// so re-run a few times after the viewer appears.
+// so a short burst of passes runs first, then a watcher keeps re-applying the
+// rule while the viewer is on screen. The old version only ran four passes
+// within 2.5s, so anything created later (a new Reel after a swipe, a lazily
+// built action rail) was never hidden — that is why the feature looked dead.
+static void MDFHideOverlayControlsPass(UIView *view) {
+    MDFHideOverlayControls(view);
+    MDFHideReelsControlsByClassName(view);
+}
+
+@interface MDFReelsOverlayWatcher : NSObject
+@property (nonatomic, weak) UIView *root;
+@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, assign) NSUInteger ticks;
+@end
+
+@implementation MDFReelsOverlayWatcher
+
++ (instancetype)watcherForRoot:(UIView *)root {
+    static NSMutableArray<MDFReelsOverlayWatcher *> *watchers;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ watchers = [NSMutableArray array]; });
+
+    for (MDFReelsOverlayWatcher *existing in [watchers copy]) {
+        if (existing.root == root) return existing;
+    }
+    MDFReelsOverlayWatcher *watcher = [[MDFReelsOverlayWatcher alloc] init];
+    watcher.root = root;
+    watcher.ticks = 0;
+    [watchers addObject:watcher];
+    // 20 ticks x 0.5s = 10s of coverage, which spans a full Reel and the next
+    // one, then stops so a long session does not burn CPU.
+    watcher.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+        (void)timer;
+        UIView *root = watcher.root;
+        if (!root || !root.window || watcher.ticks++ > 20) {
+            [watcher.timer invalidate];
+            watcher.timer = nil;
+            return;
+        }
+        if (MDFPref(@"enabled", YES) && MDFPref(@"hideReelsOverlay", YES)) {
+            MDFHideOverlayControlsPass(root);
+        }
+    }];
+    return watcher;
+}
+
+@end
+
 static void MDFHideOverlayControlsDeferred(UIView *view) {
     if (!view) return;
     NSArray<NSNumber *> *delays = @[@0.25, @0.75, @1.5, @2.5];
@@ -384,11 +568,11 @@ static void MDFHideOverlayControlsDeferred(UIView *view) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (MDFPref(@"enabled", YES) && MDFPref(@"hideReelsOverlay", YES)) {
-                MDFHideOverlayControls(view);
-                MDFHideReelsControlsByClassName(view);
+                MDFHideOverlayControlsPass(view);
             }
         });
     }
+    [MDFReelsOverlayWatcher watcherForRoot:view];
 }
 
 #pragma mark - Floating window (settings trigger)
@@ -758,6 +942,9 @@ static void MDFResetPrefs(void) {
                   @"subtitle": @"Save the Reel that is playing", @"type": @"switch" },
                @{ @"key": @"downloadStories", @"title": @"Download Stories",
                   @"subtitle": @"Save the Story that is playing", @"type": @"switch" },
+               @{ @"key": @"showDownloadButton", @"title": @"Download button on media",
+                  @"subtitle": @"Floating download icon: above Like in Reels, top-right in Stories",
+                  @"type": @"switch" },
                @{ @"key": @"shareAfterDownload", @"title": @"Open share sheet after download",
                   @"subtitle": @"Videos only; off copies the media link instead", @"type": @"switch" } ] },
         @{ @"title": @"Reels and Stories",
@@ -1011,14 +1198,137 @@ static void MDFShowConfirmLike(dispatch_block_t onConfirm) {
 }
 
 #pragma mark - Download helpers
+//
+// Facebook serves video over HLS, so the URL is usually an .m3u8 playlist, not
+// a media file. Downloading the playlist with NSURLSession yields a text file,
+// not a video — which is why the old download "worked" but produced nothing
+// usable. Playlists are parsed and every segment is fetched, then the segments
+// are concatenated into a single .ts file.
+
+static void MDFFinishDownload(NSURL *localFile, NSURL *remoteURL) {
+    if (MDFPref(@"shareAfterDownload", YES)) {
+        MDFPresentShare(localFile);
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIPasteboard.generalPasteboard.URL = remoteURL;
+            MDFToast(@"Link copied");
+        });
+    }
+}
+
+// Reads a playlist and resolves every segment URL, following the media playlist
+// that a master playlist points at.
+static void MDFDownloadHLS(NSURL *playlistURL, NSURL *originalURL, NSUInteger depth) {
+    if (depth > 3) return;
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:playlistURL];
+    request.timeoutInterval = 30;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request
+                                    completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        (void)response;
+        if (!data.length) {
+            MDFLog(@"hls playlist failed: %@", error);
+            return;
+        }
+        NSString *playlist = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (!playlist.length) return;
+
+        NSMutableArray<NSString *> *segmentLines = [NSMutableArray array];
+        NSMutableArray<NSString *> *variantLines = [NSMutableArray array];
+        for (NSString *rawLine in [playlist componentsSeparatedByCharactersInSet:
+                                   [NSCharacterSet newlineCharacterSet]]) {
+            NSString *line = [rawLine stringByTrimmingCharactersInSet:
+                              [NSCharacterSet whitespaceCharacterSet]];
+            if (!line.length) continue;
+            if ([line hasPrefix:@"#"]) continue;
+            [segmentLines addObject:line];
+            if ([line containsString:@".m3u8"]) [variantLines addObject:line];
+        }
+
+        // A master playlist lists variant streams; follow the first one.
+        if (segmentLines.count == 0 && variantLines.count > 0) {
+            NSURL *variant = [NSURL URLWithString:variantLines.firstObject relativeToURL:playlistURL];
+            MDFDownloadHLS(variant.absoluteURL, originalURL, depth + 1);
+            return;
+        }
+        if (segmentLines.count == 0) {
+            MDFLog(@"hls playlist had no segments");
+            return;
+        }
+
+        NSMutableArray<NSURL *> *segments = [NSMutableArray array];
+        for (NSString *line in segmentLines) {
+            NSURL *segment = [NSURL URLWithString:line relativeToURL:playlistURL];
+            if (segment.absoluteURL) [segments addObject:segment.absoluteURL];
+        }
+        MDFLog(@"hls: %lu segments", (unsigned long)segments.count);
+
+        // Segments must be concatenated in playlist order, so the index is
+        // written to a per-segment file and merged afterwards.
+        NSString *workDir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                             [NSString stringWithFormat:@"mdf-hls-%@", NSUUID.UUID.UUIDString]];
+        [[NSFileManager defaultManager] createDirectoryAtPath:workDir
+                                  withIntermediateDirectories:YES attributes:nil error:NULL];
+        dispatch_group_t group = dispatch_group_create();
+        for (NSUInteger i = 0; i < segments.count; i++) {
+            dispatch_group_enter(group);
+            NSURL *segmentURL = segments[i];
+            NSUInteger index = i;
+            [[[NSURLSession sharedSession] dataTaskWithURL:segmentURL
+                                         completionHandler:^(NSData *segmentData, NSURLResponse *r, NSError *e) {
+                (void)r; (void)e;
+                if (segmentData.length) {
+                    NSString *part = [workDir stringByAppendingPathComponent:
+                                      [NSString stringWithFormat:@"%06lu.part", (unsigned long)index]];
+                    [segmentData writeToFile:part atomically:YES];
+                }
+                dispatch_group_leave(group);
+            }] resume];
+        }
+        dispatch_group_notify(group, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSString *output = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                                [NSString stringWithFormat:@"MooDfacebook-%@.ts", NSUUID.UUID.UUIDString]];
+            [[NSFileManager defaultManager] createFileAtPath:output contents:nil attributes:nil];
+            NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:output];
+            for (NSUInteger i = 0; i < segments.count; i++) {
+                NSString *part = [workDir stringByAppendingPathComponent:
+                                  [NSString stringWithFormat:@"%06lu.part", (unsigned long)i]];
+                NSData *segmentData = [NSData dataWithContentsOfFile:part];
+                if (segmentData.length) [handle writeData:segmentData];
+            }
+            [handle closeFile];
+            [[NSFileManager defaultManager] removeItemAtPath:workDir error:NULL];
+            MDFLog(@"hls saved to %@", output);
+            MDFFinishDownload([NSURL fileURLWithPath:output], originalURL);
+        });
+    }] resume];
+}
 
 static void MDFDownloadAndShare(NSURL *remoteURL) {
     if (!remoteURL) return;
     MDFLog(@"downloading %@", remoteURL.absoluteString);
+    dispatch_async(dispatch_get_main_queue(), ^{ MDFToast(@"Downloading…"); });
+
+    BOOL looksLikePlaylist = [remoteURL.pathExtension.lowercaseString isEqualToString:@"m3u8"];
+    if (looksLikePlaylist) {
+        MDFDownloadHLS(remoteURL, remoteURL, 0);
+        return;
+    }
+
     [[[NSURLSession sharedSession] downloadTaskWithURL:remoteURL
                                      completionHandler:^(NSURL *location, NSURLResponse *response, NSError *error) {
-        (void)response;
         if (!location) { MDFLog(@"download failed: %@", error); return; }
+        NSData *head = [NSData dataWithContentsOfFile:location.path
+                                              options:NSDataReadingMappedIfSafe error:NULL];
+        // A plain download can still return a playlist (Facebook sometimes
+        // serves .m3u8 without the extension), so sniff the body.
+        if (head.length) {
+            NSString *prefix = [[NSString alloc] initWithData:[head subdataWithRange:
+                NSMakeRange(0, MIN(head.length, 64))] encoding:NSUTF8StringEncoding];
+            if ([prefix containsString:@"#EXTM3U"]) {
+                MDFDownloadHLS(remoteURL, remoteURL, 0);
+                return;
+            }
+        }
         NSString *name = remoteURL.lastPathComponent.length ? remoteURL.lastPathComponent : @"MooDfacebook-media";
         if (![name containsString:@"."]) name = [name stringByAppendingPathExtension:@"mp4"];
         NSURL *target = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:name]];
@@ -1028,14 +1338,7 @@ static void MDFDownloadAndShare(NSURL *remoteURL) {
             MDFLog(@"move failed: %@", moveError);
             return;
         }
-        if (MDFPref(@"shareAfterDownload", YES)) {
-            MDFPresentShare(target);
-        } else {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIPasteboard.generalPasteboard.URL = remoteURL;
-                MDFToast(@"Link copied");
-            });
-        }
+        MDFFinishDownload(target, remoteURL);
     }] resume];
 }
 
@@ -1053,7 +1356,162 @@ static void MDFSaveAndShareImage(UIImage *image) {
     MDFPresentShare(fileURL);
 }
 
-#pragma mark - Long-press download handler
+#pragma mark - Download button overlay
+//
+// A small, always-visible download button is placed on media, because the
+// long-press trigger is unreliable inside Facebook's gesture stack: Facebook
+// installs its own recognisers and they frequently win the arena.
+//
+// Placement follows the requirement:
+//   * Reels / videos: left side, directly above the Like button.
+//   * Stories:        top-right corner.
+// The button re-positions itself on every layout pass, so it follows the Like
+// button even when the action rail is rebuilt or the device rotates.
+
+static UIButton *MDFMakeDownloadButton(void) {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+    button.frame = CGRectMake(0, 0, 40, 40);
+    button.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.55];
+    button.layer.cornerRadius = 20;
+    button.accessibilityIdentifier = kMDFDownloadButtonIdentifier;
+    button.accessibilityLabel = @"Download";
+    UIImage *icon = [UIImage systemImageNamed:@"arrow.down.circle.fill"];
+    if (icon) {
+        [button setImage:icon forState:UIControlStateNormal];
+        button.tintColor = UIColor.whiteColor;
+    } else {
+        [button setTitle:@"⤓" forState:UIControlStateNormal];
+        [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    }
+    return button;
+}
+
+@interface MDFDownloadButtonTarget : NSObject
++ (instancetype)shared;
+- (void)tapped:(UIButton *)sender;
+@end
+
+@implementation MDFDownloadButtonTarget
++ (instancetype)shared {
+    static MDFDownloadButtonTarget *target;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ target = [[MDFDownloadButtonTarget alloc] init]; });
+    return target;
+}
+
+- (void)tapped:(UIButton *)sender {
+    if (!MDFPref(@"enabled", YES)) return;
+    if (!MDFPref(@"showDownloadButton", YES)) return;
+    UIView *host = sender.superview;
+    NSString *scope = objc_getAssociatedObject(sender, "mdf.scope");
+    MDFLog(@"download button tapped, scope=%@", scope);
+
+    BOOL allowed = MDFPref(@"downloadMedia", YES);
+    if ([scope isEqualToString:kMDFScopeReels]) allowed = MDFPref(@"downloadReels", YES);
+    if ([scope isEqualToString:kMDFScopeStories]) allowed = MDFPref(@"downloadStories", YES);
+    if (!allowed) { MDFToast(@"Downloading is off for this section"); return; }
+
+    NSURL *video = MDFVideoURLInView(host);
+    if (video) { MDFDownloadAndShare(video); return; }
+    UIImage *image = MDFImageInView(host);
+    if (image) { MDFSaveAndShareImage(image); return; }
+    MDFToast(@"No media found here");
+}
+@end
+
+// Finds the Like button in the action rail so the download button can sit
+// directly above it. Facebook labels it, so the accessibility label is the most
+// reliable signal; the class name is the fallback.
+static UIView *MDFFindLikeControl(UIView *view, NSUInteger depth) {
+    if (!view || depth > 10) return nil;
+    NSString *label = view.accessibilityLabel.lowercaseString;
+    NSString *identifier = view.accessibilityIdentifier.lowercaseString;
+    NSString *className = NSStringFromClass([view class]).lowercaseString;
+    BOOL labelLike = label.length && ([label containsString:@"like"] ||
+                                      [label containsString:@"إعجاب"] ||
+                                      [label containsString:@"أعجبني"]);
+    BOOL identifierLike = identifier.length && [identifier containsString:@"like"];
+    BOOL classLike = [className containsString:@"like"];
+    if ((labelLike || identifierLike || classLike) &&
+        [view isKindOfClass:[UIControl class]]) {
+        return view;
+    }
+    for (UIView *sub in view.subviews) {
+        UIView *found = MDFFindLikeControl(sub, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static BOOL MDFViewIsDownloadButton(UIView *view) {
+    return [view.accessibilityIdentifier isEqualToString:kMDFDownloadButtonIdentifier];
+}
+
+// Walks the viewer and positions one download button. Called repeatedly, so it
+// must be idempotent: it reuses the existing button instead of adding another.
+static void MDFUpdateDownloadButton(UIView *root, NSString *scope) {
+    if (!root || !scope.length) return;
+    if (!MDFPref(@"enabled", YES) || !MDFPref(@"showDownloadButton", YES)) return;
+
+    UIButton *button = nil;
+    for (UIView *sub in root.subviews) {
+        if (MDFViewIsDownloadButton(sub)) { button = (UIButton *)sub; break; }
+    }
+    if (!button) {
+        button = MDFMakeDownloadButton();
+        objc_setAssociatedObject(button, "mdf.scope", scope, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        [button addTarget:[MDFDownloadButtonTarget shared]
+                   action:@selector(tapped:)
+         forControlEvents:UIControlEventTouchUpInside];
+        [root addSubview:button];
+        [root bringSubviewToFront:button];
+    }
+    [root bringSubviewToFront:button];
+
+    CGRect bounds = root.bounds;
+    if ([scope isEqualToString:kMDFScopeStories]) {
+        // Stories: top-right corner, clear of the status bar.
+        CGFloat top = root.safeAreaInsets.top + 12;
+        button.center = CGPointMake(bounds.size.width - 36, top + 20);
+    } else {
+        // Reels / videos: left side, directly above the Like button.
+        UIView *like = MDFFindLikeControl(root, 0);
+        if (like) {
+            CGRect likeFrame = [like convertRect:like.bounds toView:root];
+            button.center = CGPointMake(likeFrame.origin.x + likeFrame.size.width / 2,
+                                        likeFrame.origin.y - 34);
+        } else {
+            // No Like button found (or it is off-screen): fall back to a stable
+            // spot on the left rail, vertically centred.
+            button.center = CGPointMake(36, bounds.size.height * 0.62);
+        }
+    }
+    button.hidden = NO;
+}
+
+static void MDFUpdateDownloadButtonDeferred(UIView *root, NSString *scope) {
+    if (!root || !scope.length) return;
+    NSArray<NSNumber *> *delays = @[@0.1, @0.4, @0.9, @1.6, @2.4];
+    for (NSNumber *delay in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            MDFUpdateDownloadButton(root, scope);
+        });
+    }
+}
+
+// Feed cells (photos and videos in the timeline). The button is pinned to the
+// media area rather than the whole cell, so it does not overlap the caption.
+static void MDFAttachDownloadButtonToCell(UIView *cell) {
+    if (!cell) return;
+    if (!MDFPref(@"enabled", YES) || !MDFPref(@"showDownloadButton", YES)) return;
+    if (!MDFPref(@"downloadMedia", YES)) return;
+    if (!MDFFeedContainerAncestor(cell)) return;
+    if (cell.hidden) return;
+    // Only add the button to cells that actually contain media.
+    if (!MDFViewContainsPlayer(cell) && !MDFImageInView(cell)) return;
+    MDFUpdateDownloadButton(cell, kMDFScopeMedia);
+}
 
 @interface MDFMediaGestureHandler : NSObject
 + (instancetype)shared;
@@ -1083,7 +1541,10 @@ static void MDFSaveAndShareImage(UIImage *image) {
     NSURL *video = MDFVideoURLInView(host);
     if (video) { MDFDownloadAndShare(video); return; }
     UIImage *image = MDFImageInView(host);
-    if (image) MDFSaveAndShareImage(image);
+    if (image) { MDFSaveAndShareImage(image); return; }
+    // The gesture fired but there was nothing downloadable under the touch.
+    // Reporting it makes the feature observable instead of looking broken.
+    MDFToast(@"No media found here");
 }
 
 @end
@@ -1104,33 +1565,119 @@ static void MDFInstallLongPress(UIView *host, NSString *scope) {
 }
 
 #pragma mark - Feed cell processing
+//
+// Cell recycling is the subtle part. Facebook reuses cell objects as you
+// scroll, so a cell that was hidden for one post is handed back for a different
+// post. The old code only ever set hidden = YES and never cleared it, so once a
+// sponsored post scrolled past, every later post that reused that cell object
+// stayed invisible. That is why the whole feed sometimes disappeared and
+// sometimes nothing happened at all: it depended on which cells got recycled.
+//
+// The rule is therefore symmetric: decide the state on every layout pass and
+// assign it, so a recycled cell is always restored before being re-evaluated.
+// The decision is also cached per cell so a cell that matched once keeps its
+// state even if its subviews are rebuilt.
+
+static void *kMDFCellDecisionKey = &kMDFCellDecisionKey;
+
+static BOOL MDFCellShouldHide(UIView *cell) {
+    // Only touch cells that live in a feed container: this keeps the hooks from
+    // hiding cells in unrelated collection/table views (for example a picker).
+    if (!MDFFeedContainerAncestor(cell)) return NO;
+
+    // The header is the top band of the cell: author line + "Sponsored" badge.
+    // Only that band is scanned for ads, so a post whose body text merely
+    // contains the word "sponsored" is not hidden.
+    BOOL hideAds = MDFPref(@"hideAds", YES);
+    BOOL hidePYMK = MDFPref(@"hidePYMK", YES);
+    BOOL hideReelsCarousel = MDFPref(@"hideReelsCarousel", YES);
+    if (!hideAds && !hidePYMK && !hideReelsCarousel) return NO;
+
+    if (hideAds) {
+        if (MDFViewShallowMatchesMarkers(cell, MDFAdMarkers(), 3)) return YES;
+        if (MDFViewIdentifierMatchesMarkers(cell, MDFAdIdentifierMarkers())) return YES;
+        if (MDFViewMatchesClassNames(cell, MDFAdClassMarkers())) return YES;
+    }
+    if (hidePYMK) {
+        if (MDFViewShallowMatchesMarkers(cell, MDFPYMKMarkers(), 4)) return YES;
+        if (MDFViewShallowMatchesMarkers(cell, MDFSuggestedMarkers(), 4)) return YES;
+    }
+    if (hideReelsCarousel) {
+        // The Reels shelf is identified primarily by its *class*, not by loose
+        // text: a normal video post also contains the word "reels" in its body,
+        // which is what made this feature hide ordinary posts. The text marker
+        // is therefore only consulted at depth 2, where the shelf's own header
+        // ("Reels and short videos") lives — never the post body.
+        if (MDFViewMatchesClassNames(cell, MDFReelsShelfClassMarkers())) return YES;
+        if (MDFViewShallowMatchesMarkers(cell, MDFReelsMarkers(), 2)) return YES;
+    }
+    return NO;
+}
 
 static void MDFProcessFeedCell(UIView *cell) {
     if (!MDFPref(@"enabled", YES)) return;
-    // Only touch cells that live in a feed container: this keeps the hooks from
-    // hiding cells in unrelated collection/table views (for example a picker).
-    if (!MDFFeedContainerAncestor(cell)) return;
-    if (!cell.hidden) {
-        if (MDFPref(@"hideAds", YES) && MDFViewMatchesMarkers(cell, MDFAdMarkers())) {
-            cell.hidden = YES;
-            MDFLog(@"hid sponsored cell %@", NSStringFromClass([cell class]));
-        } else if (MDFPref(@"hidePYMK", YES) &&
-                   (MDFViewMatchesMarkers(cell, MDFPYMKMarkers()) ||
-                    MDFViewMatchesMarkers(cell, MDFSuggestedMarkers()))) {
-            cell.hidden = YES;
-            MDFLog(@"hid suggestion cell %@", NSStringFromClass([cell class]));
-        } else if (MDFPref(@"hideReelsCarousel", YES) &&
-                   MDFViewMatchesMarkers(cell, MDFReelsMarkers())) {
-            cell.hidden = YES;
-            MDFLog(@"hid reels shelf cell %@", NSStringFromClass([cell class]));
+
+    BOOL shouldHide = MDFCellShouldHide(cell);
+    NSNumber *previous = objc_getAssociatedObject(cell, kMDFCellDecisionKey);
+    if (!previous || previous.boolValue != shouldHide) {
+        objc_setAssociatedObject(cell, kMDFCellDecisionKey,
+                                 @(shouldHide), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (shouldHide) {
+            MDFLog(@"hiding feed cell %@", NSStringFromClass([cell class]));
         }
     }
+    if (cell.hidden != shouldHide) cell.hidden = shouldHide;
+
+    if (!shouldHide) MDFDumpCellText(cell);
+
     if (MDFPref(@"downloadMedia", YES)) MDFInstallLongPress(cell, kMDFScopeMedia);
+    MDFAttachDownloadButtonToCell(cell);
 }
 
 #pragma mark - Incognito Stories (no seen receipt)
+//
+// Two bugs made this feature dead. First, the class-name test was
+// case-sensitive ("Story" never matched a class named "...story...").
+// Second, the scan ran once at load time, on a background queue, before
+// Facebook had even loaded its Story classes — so there was nothing to hook.
+// The scan now runs case-insensitively and is retried a few times after launch.
 
 static void MDFNoopIMP(void) {}
+
+// Methods that must never be no-op'd even though they look like seen-tracking:
+// a getter returning a value would leave the return register undefined.
+static BOOL MDFSelectorIsGetter(const char *selectorName) {
+    return strncmp(selectorName, "is", 2) == 0 ||
+           strncmp(selectorName, "has", 3) == 0 ||
+           strncmp(selectorName, "get", 3) == 0;
+}
+
+static BOOL MDFClassNameLooksLikeStory(const char *className) {
+    if (!className) return NO;
+    // Case-insensitive so "FBStory", "storyviewer" and "StorySeenState" all hit.
+    static const char *needles[] = {"story", "stories"};
+    for (size_t i = 0; i < sizeof(needles) / sizeof(needles[0]); i++) {
+        const char *needle = needles[i];
+        size_t needleLength = strlen(needle);
+        size_t classNameLength = strlen(className);
+        if (classNameLength < needleLength) continue;
+        for (size_t start = 0; start + needleLength <= classNameLength; start++) {
+            if (strncasecmp(className + start, needle, needleLength) == 0) return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL MDFSelectorLooksLikeSeenTracking(const char *selectorName) {
+    if (!selectorName) return NO;
+    static const char *needles[] = {"markstoryseen", "markseen", "setstoryseen",
+                                    "reportseen", "storyseen", "markasseen",
+                                    "didseestory", "setseen", "seenstory"};
+    for (size_t i = 0; i < sizeof(needles) / sizeof(needles[0]); i++) {
+        if (strcasestr(selectorName, needles[i])) return YES;
+    }
+    return NO;
+}
 
 static void MDFDisableStorySeenTracking(void) {
     if (!MDFPref(@"incognitoStories", YES)) return;
@@ -1140,19 +1687,15 @@ static void MDFDisableStorySeenTracking(void) {
     for (unsigned int i = 0; i < classCount; i++) {
         Class cls = classes[i];
         const char *className = class_getName(cls);
-        if (!className || !strstr(className, "Story")) continue;
+        if (!MDFClassNameLooksLikeStory(className)) continue;
         unsigned int methodCount = 0;
         Method *methods = class_copyMethodList(cls, &methodCount);
         if (!methods) continue;
         for (unsigned int j = 0; j < methodCount; j++) {
             Method method = methods[j];
             const char *selectorName = sel_getName(method_getName(method));
-            if (!selectorName) continue;
-            if (!(strstr(selectorName, "markStorySeen") || strstr(selectorName, "markSeen") ||
-                  strstr(selectorName, "setStorySeen") || strstr(selectorName, "reportSeen") ||
-                  strstr(selectorName, "storySeen"))) {
-                continue;
-            }
+            if (!MDFSelectorLooksLikeSeenTracking(selectorName)) continue;
+            if (MDFSelectorIsGetter(selectorName)) continue;
             // Only replace methods that return void: a no-op IMP on a method
             // that returns a value would leave the return register undefined.
             const char *types = method_getTypeEncoding(method);
@@ -1163,6 +1706,18 @@ static void MDFDisableStorySeenTracking(void) {
         free(methods);
     }
     free(classes);
+}
+
+// Facebook loads its Story classes lazily, so the scan is retried after launch
+// instead of running only once.
+static void MDFScheduleIncognitoScan(void) {
+    NSArray<NSNumber *> *delays = @[@0.5, @3.0, @8.0, @20.0];
+    for (NSNumber *delay in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            MDFDisableStorySeenTracking();
+        });
+    }
 }
 
 #pragma mark - Reels / Stories controller handling
@@ -1181,9 +1736,17 @@ static void MDFHandleViewControllerAppear(UIViewController *controller) {
             MDFHideReelsControlsByClassName(controller.view);
             MDFHideOverlayControlsDeferred(controller.view);
         }
-        if (MDFPref(@"downloadReels", YES)) MDFInstallLongPress(controller.view, kMDFScopeReels);
+        if (MDFPref(@"downloadReels", YES)) {
+            MDFInstallLongPress(controller.view, kMDFScopeReels);
+            MDFUpdateDownloadButton(controller.view, kMDFScopeReels);
+            MDFUpdateDownloadButtonDeferred(controller.view, kMDFScopeReels);
+        }
     } else if (isStory) {
-        if (MDFPref(@"downloadStories", YES)) MDFInstallLongPress(controller.view, kMDFScopeStories);
+        if (MDFPref(@"downloadStories", YES)) {
+            MDFInstallLongPress(controller.view, kMDFScopeStories);
+            MDFUpdateDownloadButton(controller.view, kMDFScopeStories);
+            MDFUpdateDownloadButtonDeferred(controller.view, kMDFScopeStories);
+        }
     }
 }
 
@@ -1265,13 +1828,31 @@ static void MDFHandleViewControllerAppear(UIViewController *controller) {
 }
 %end
 
-// Remember the URL of the item being played so long-press can download it.
+// Remember the URL of the item being played so a download can resolve it. The
+// item is hooked as well as the player: Facebook often builds the item first and
+// hands it to a player we never see, so the item carries the URL either way.
+%hook AVPlayerItem
+- (instancetype)initWithURL:(NSURL *)URL {
+    self = %orig;
+    if (self && URL) objc_setAssociatedObject(self, "mdf.mediaURL", URL, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return self;
+}
+- (instancetype)initWithAsset:(AVAsset *)asset {
+    self = %orig;
+    if (self) {
+        NSURL *url = MDFResolveAssetURL(asset);
+        if (url) objc_setAssociatedObject(self, "mdf.mediaURL", url, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return self;
+}
+%end
+
 %hook AVPlayer
 - (void)replaceCurrentItemWithPlayerItem:(AVPlayerItem *)item {
     %orig;
-    AVAsset *asset = item.asset;
-    if ([asset isKindOfClass:[AVURLAsset class]]) {
-        NSURL *url = ((AVURLAsset *)asset).URL;
+    NSURL *url = objc_getAssociatedObject(item, "mdf.mediaURL");
+    if (!url) url = MDFResolveAssetURL(item.asset);
+    if (url) {
         objc_setAssociatedObject(self, "mdf.mediaURL", url, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         MDFLog(@"playing %@", url.absoluteString);
     }
@@ -1290,11 +1871,9 @@ static void MDFHandleViewControllerAppear(UIViewController *controller) {
 %ctor {
     MDFRegisterDefaults();
     MDFObserveSceneLifecycle();
-    // Scanning every loaded class is cheap but not free, and Facebook loads a
-    // very large number of them, so keep it off the launch-critical path.
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        MDFDisableStorySeenTracking();
-    });
+    // Facebook loads its Story classes lazily, so the incognito scan is retried
+    // after launch instead of running once on the launch-critical path.
+    MDFScheduleIncognitoScan();
     // Fallback in case makeKeyAndVisible ran before the tweak was injected.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
