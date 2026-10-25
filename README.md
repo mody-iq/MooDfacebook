@@ -4,20 +4,58 @@ A RootHide Theos tweak for **Facebook** (`com.facebook.Facebook`) on **iOS 18.x 
 
 ## Features
 
-| # | Feature | Default | Pref key |
-|---|---------|---------|----------|
-| 1 | Remove ads / sponsored + suggested posts | ON | `hideAds` |
-| 2 | Remove "People you may know" | ON | `hidePYMK` |
-| 3 | Hide the Reels carousel / shelf | ON | `hideReelsCarousel` |
-| 4 | Confirm before a post is liked | ON | `confirmLike` |
-| 5 | Download media on long press | ON | `downloadMedia` |
-| 6 | Download Reels + hide the Reels overlay | ON | `downloadReels`, `hideReelsOverlay` |
-| 7 | Download Stories + watch incognito (no seen receipt) | ON | `downloadStories`, `incognitoStories` |
+Every feature has its own switch in the in-app settings screen and is stored in
+the `NSUserDefaults` suite `com.mody-iq.moodfacebook`.
 
-Every feature is ON by default, so the tweak works with no preference bundle installed.
-The master switch is `enabled`. Set `debug` to `YES` for `[MooDfacebook]` logging.
+| Feature | Default | Pref key |
+|---------|---------|----------|
+| Enable tweak (master switch) | ON | `enabled` |
+| Remove ads / sponsored + suggested posts | ON | `hideAds` |
+| Remove "People You May Know" | ON | `hidePYMK` |
+| Hide the Reels carousel / shelf | ON | `hideReelsCarousel` |
+| Confirm before a post is liked | ON | `confirmLike` |
+| Download media on long press | ON | `downloadMedia` |
+| Download Reels | ON | `downloadReels` |
+| Hide the Reels UI overlay (player stays visible) | ON | `hideReelsOverlay` |
+| Download Stories | ON | `downloadStories` |
+| Watch Stories incognito (no seen receipt) | ON | `incognitoStories` |
+| Open the share sheet after a video download | ON | `shareAfterDownload` |
+| Floating settings button | ON | `showFloatingButton` |
+| Verbose logging | OFF | `debug` |
 
-Preferences live in the `NSUserDefaults` suite `com.mody-iq.moodfacebook`.
+All features are ON by default, so the tweak works with no preference bundle
+installed. Image downloads always use the share sheet, because Facebook's
+`Info.plist` has no photo-library usage description.
+
+## Opening the settings screen
+
+Two triggers, both deterministic:
+
+1. **Floating gear button** - draggable, sits over the Facebook UI.
+2. **Triple tap** anywhere on the screen, which works even when the button is
+   hidden.
+
+The previous long-press trigger was removed: Facebook installs its own
+long-press recognisers on the feed and they win the gesture arena.
+
+## Bug fixes in 2.0.0
+
+**Confirm like used to flash and disappear.** The alert is now presented on the
+main thread from a `UIWindow` owned by the tweak, so a Facebook view-controller
+transition cannot tear it down. An in-flight guard stops a second prompt from
+dismissing the first, and the confirmed like is let through by matching its exact
+target/action pair instead of a global flag.
+
+**Sponsored posts stayed visible.** Cell matching now reads `text`,
+`attributedText`, accessibility labels and accessibility identifiers from every
+view in the subtree, not just `UILabel`, and only hides cells that live inside a
+scrollable container so unrelated table/collection views are left alone.
+
+**Reels showed a black screen.** The old code hid the first subtree that matched
+the word "Like", which was usually the player container. A view is now hidden
+only when it is a genuine control (a `UIControl`, or a view whose own
+accessibility text says so) and its subtree contains no `AVPlayerLayer`. Close
+and back controls are explicitly excluded so you can always leave the viewer.
 
 ## Layout
 
@@ -38,7 +76,8 @@ export THEOS=/path/to/theos          # roothide/theos fork
 make package FINALPACKAGE=1
 ```
 
-CI: push to `main` and download the **MooDfacebook-deb** artifact from the Actions run.
+CI: push to `main` and download the **MooDfacebook-deb** artifact from the
+Actions run.
 
 ## Install
 
@@ -47,4 +86,3 @@ CI: push to `main` and download the **MooDfacebook-deb** artifact from the Actio
 3. Open Facebook.
 
 Author: **Mody**
-
