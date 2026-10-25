@@ -1,0 +1,46 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build MooDfacebook (.deb)
+    runs-on: macos-14
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Theos
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/theos
+          key: theos-roothide-${{ runner.os }}-v1
+
+      - name: Install Theos (roothide fork)
+        uses: Randomblock1/theos-action@v1
+        with:
+          theos-src: https://github.com/roothide/theos
+
+      - name: Build package
+        run: make package FINALPACKAGE=1
+
+      - name: List package
+        run: ls -lh packages/
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: MooDfacebook-deb
+          path: packages/*.deb
+          if-no-files-found: error
