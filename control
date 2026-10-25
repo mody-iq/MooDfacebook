@@ -1,9 +1,0 @@
-Package: com.modyiq.moodfacebook
-Name: MooDfacebook
-Version: 0.2.0
-Architecture: iphoneos-arm64e
-Description: Facebook power toolkit for RootHide — ads, reels, stories, downloads, confirm likes
-Maintainer: Mody
-Author: Mody
-Section: Tweaks
-Depends: mobilesubstrate
